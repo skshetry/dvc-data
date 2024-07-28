@@ -1,7 +1,7 @@
 import reprlib
 from typing import TYPE_CHECKING, Optional
 
-from attrs import asdict, define, field
+from attrs import define, field
 
 if TYPE_CHECKING:
     from .db import HashFileDB
@@ -65,7 +65,11 @@ class DiffResult:
 
     @property
     def stats(self) -> dict[str, int]:
-        return {k: len(v) for k, v in asdict(self).items() if k != "unchanged"}
+        return {
+            "added": len(self.added),
+            "modified": len(self.modified),
+            "deleted": len(self.deleted),
+        }
 
 
 ROOT = ("",)
