@@ -57,7 +57,7 @@ class HashFileDB(ObjectDB):
         from dvc_data.hashfile.state import StateNoop
 
         super().__init__(fs, path, read_only=read_only)
-        self.state: "StateBase" = config.get("state", StateNoop())
+        self.state: StateBase = config.get("state", StateNoop())
         self.verify = config.get("verify", self.DEFAULT_VERIFY)
         self.cache_types = config.get("type") or copy(self.DEFAULT_CACHE_TYPES)
         self.slow_link_warning = config.get("slow_link_warning", True)
@@ -108,7 +108,7 @@ class HashFileDB(ObjectDB):
             **kwargs,
         )
 
-        oid_cache_paths = {o: self.oid_to_path(oid) for o in oids}
+        oid_cache_paths = {o: self.oid_to_path(o) for o in oids}
         for o, cache_path in oid_cache_paths.items():
             try:
                 if verify:

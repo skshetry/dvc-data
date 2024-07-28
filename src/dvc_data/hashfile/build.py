@@ -1,14 +1,21 @@
 import hashlib
 import logging
 import os
-from typing import TYPE_CHECKING, Any, Optional, cast
+from functools import partial
+from multiprocessing import cpu_count
+from typing import TYPE_CHECKING, Optional, cast
 
+import funcy
+from dvc_objects.executors import ThreadPoolExecutor
 from fsspec.callbacks import DEFAULT_CALLBACK, Callback
+from fsspec.utils import nullcontext
 
 from dvc_data.callbacks import TqdmCallback
+from dvc_data.hashfile.hash_info import HashInfo
+from dvc_data.hashfile.state import StateBase
 
 from .db.reference import ReferenceHashFileDB
-from .hash import hash_file
+from .hash import LargeFileHashingCallback, _hash_file, hash_file
 from .meta import Meta
 from .obj import HashFile
 
@@ -19,6 +26,7 @@ if TYPE_CHECKING:
 
     from ._ignore import Ignore
     from .db import HashFileDB
+    from .state import StateBase
     from .tree import Tree
 
 
@@ -87,6 +95,7 @@ def _build_file(path, fs, name, odb=None, upload_odb=None, dry_run=False):
     return meta, obj
 
 
+@funcy.print_durations
 def _build_tree(
     path,
     fs,
@@ -123,30 +132,42 @@ def _build_tree(
 
     tree = Tree()
 
-    for root, _, fnames in walk_iter:
-        if DefaultIgnoreFile in fnames:
-            raise IgnoreInCollectedDirError(
-                DefaultIgnoreFile, fs.join(root, DefaultIgnoreFile)
-            )
+    upload_odb = kwargs.get("upload_odb")
+    dry_run = kwargs.get("dry_run", False)
+    for root, _, files in walk_iter:
+        # NOTE: might happen with s3/gs/azure/etc, where empty
+        # objects like `dir/` might be used to create an empty dir
+        fnames: list[str] = [fname for fname in files if fname != ""]
+        if not fnames:
+            continue
 
         # NOTE: we know for sure that root starts with path, so we can use
         # faster string manipulation instead of a more robust relparts()
-        rel_key: tuple[Optional[Any], ...] = ()
+        rel_key: tuple[str, ...] = ()
         if root != path:
             rel_key = tuple(root[len(path) + 1 :].split(fs.sep))
 
-        for fname in fnames:
-            if fname == "":
-                # NOTE: might happen with s3/gs/azure/etc, where empty
-                # objects like `dir/` might be used to create an empty dir
-                continue
+        objects = _build_files(
+            path,
+            root,
+            fnames,
+            fs=fs,
+            odb=odb,
+            name=name,
+            callback=callback,
+            upload_odb=upload_odb,
+            dry_run=dry_run,
+        )
 
-            callback.relative_update(1)
-            meta, obj = _build_file(
-                f"{root}{fs.sep}{fname}", fs, name, odb=odb, **kwargs
-            )
-            key = (*rel_key, fname)
-            tree.add(key, meta, obj.hash_info)
+        for fname, (meta, hi) in objects.items():
+            if fname == DefaultIgnoreFile:
+                raise IgnoreInCollectedDirError(
+                    DefaultIgnoreFile,
+                    fs.join(root, DefaultIgnoreFile),
+                )
+
+            key: tuple[str, ...] = (*rel_key, fname)
+            tree.add(key, meta, hi)
             tree_meta.size += meta.size or 0
             tree_meta.nfiles += 1
 
@@ -278,3 +299,117 @@ def build(
         )
 
     return staging, meta, obj
+
+
+def _build_files(  # noqa: PLR0913
+    path: str,
+    root: str,
+    fnames: list[str],
+    fs: "FileSystem",
+    name: str,
+    odb: Optional["HashFileDB"] = None,
+    callback: "Callback" = DEFAULT_CALLBACK,
+    upload_odb: Optional["HashFileDB"] = None,
+    dry_run: bool = False,
+    jobs: Optional[int] = None,
+    large_file_threshold: int = 2**20,
+) -> dict[str, tuple[Meta, HashInfo]]:
+    paths: list[str] = [f"{root}{fs.sep}{fname}" for fname in fnames]
+    state: Optional[StateBase] = odb.state if odb else None
+
+    state_data: dict[str, tuple[Meta, HashInfo, dict]] = {}
+    large_files_to_hash: list[tuple[str, dict]] = []
+    small_files_to_hash: list[tuple[str, dict]] = []
+
+    infos: dict[str, dict] = {path: fs.info(path) for path in paths}
+    if state and paths:
+        for p, meta, hi in state.get_many(paths, fs, infos):
+            if meta is not None and hi is not None and hi.name == name:
+                state_data[p] = (meta, hi, infos[p])
+            else:
+                info = infos[p]
+                size = info.get("size")
+                if size and size > large_file_threshold:
+                    large_files_to_hash.append((p, info))
+                else:
+                    small_files_to_hash.append((p, info))
+
+    callback.set_size((callback.size or 0) + len(paths))
+    callback.relative_update(len(state_data))
+    hashes_to_update = _hash_files(
+        fs,
+        name,
+        small_files_to_hash,
+        large_files_to_hash,
+        callback=callback,
+        jobs=jobs,
+    )
+
+    if state and hashes_to_update:
+        items = ((path, hi, info) for path, (_, hi, info) in hashes_to_update.items())
+        state.save_many(items, fs)
+        state_data.update(hashes_to_update)
+
+    objects: dict[str, tuple[Meta, HashInfo]] = {}
+    if upload_odb is not None and not dry_run:
+        assert odb is not None
+        assert name == "md5"
+        for fname, p in zip(fnames, paths):
+            meta, obj = _upload_file(p, fs, odb, upload_odb)
+            objects[fname] = (meta, obj.hash_info)
+        return objects
+
+    if not dry_run:
+        assert odb is not None
+        to_add = {p: oid for p in paths if (oid := state_data[p][1].value) is not None}
+        oids = list(to_add.values())
+        paths = list(to_add)
+        odb.add(paths, fs, oids, hardlink=False)
+
+    for fname, p in zip(fnames, paths):
+        meta, hi, _ = state_data[p]
+        objects[fname] = meta, hi
+    return objects
+
+
+def _hash_single_file(
+    fs: "FileSystem",
+    name: str,
+    arg: tuple[str, dict],
+) -> tuple[str, tuple[Meta, HashInfo, dict]]:
+    p, info = arg
+    size = info.get("size")
+    context = nullcontext(None)
+    if size and size > LargeFileHashingCallback.LARGE_FILE_SIZE:
+        context = LargeFileHashingCallback(desc=p)
+
+    with context as cb:
+        oid, meta = _hash_file(p, fs, name, info=info, callback=cb)
+    return p, (meta, HashInfo(name, oid), info)
+
+
+def _hash_files(
+    fs: "FileSystem",
+    name: str,
+    small_files_to_hash: list[tuple[str, dict]],
+    large_files_to_hash: list[tuple[str, dict]],
+    callback: "Callback" = DEFAULT_CALLBACK,
+    jobs: Optional[int] = None,
+) -> dict[str, tuple[Meta, HashInfo, dict]]:
+    if jobs is None:
+        jobs = max(cpu_count(), 6)
+    assert jobs is not None
+
+    hashes: dict[str, tuple[Meta, HashInfo, dict]] = {}
+
+    for p, info in small_files_to_hash:
+        oid, meta = _hash_file(p, fs, name, info=info)
+        hashes[p] = meta, HashInfo(name, oid), info
+        callback.relative_update()
+
+    if large_files_to_hash:
+        func = partial(_hash_single_file, fs, name)
+        with ThreadPoolExecutor(max_workers=jobs) as executor:
+            large_files = executor.imap_unordered(func, large_files_to_hash)
+            hashes.update(callback.wrap(large_files))
+    return hashes

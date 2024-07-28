@@ -1,9 +1,9 @@
 import os
 import pickle
-import time
 from collections.abc import Iterable, Iterator
 from functools import wraps
-from itertools import repeat
+from itertools import zip_longest
+from time import time
 from typing import Any, Optional
 
 import diskcache
@@ -68,17 +68,17 @@ class Cache(diskcache.Cache):
     def __getstate__(self):
         return (*super().__getstate__(), self._type)
 
+
+class NewCache(Cache):
     def get_many(self, keys: Iterable[str]) -> Iterator[tuple[str, Optional[str]]]:
         if self.is_empty():
-            yield from zip(keys, repeat(None))
+            yield from zip_longest(keys, [])
             return
 
         for chunk in batched(keys, 999):
-            select = (
-                "SELECT key, value FROM Cache WHERE key IN (%s) and raw = 1"  # noqa: S608
-                % ",".join("?" * len(chunk))
-            )
-            d: dict[str, str] = dict(self._sql(select, chunk).fetchall())
+            query = ", ".join("?" * len(chunk))
+            select = f"SELECT key, value FROM Cache WHERE key IN ({query})"  # noqa: S608
+            d = dict(self._sql(select, chunk).fetchall())
             for key in chunk:
                 yield key, d.get(key)
 
@@ -86,35 +86,28 @@ class Cache(diskcache.Cache):
         if not items:
             return
 
-        raw = True
-        access_time = store_time = time.time()
-        expire_time = None
-        access_count, tag, size, mode, filename = 0, None, 0, 1, None
+        now = time()
         with self.transact(retry):
             self._con.executemany(
                 "INSERT OR REPLACE INTO Cache("
                 " key, raw, store_time, expire_time, access_time,"
-                " access_count, tag, size, mode, filename, value"
-                ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                (
-                    (
-                        key,
-                        raw,
-                        store_time,
-                        expire_time,
-                        access_time,
-                        access_count,
-                        tag,
-                        size,
-                        mode,
-                        filename,
-                        value,
-                    )
-                    for (key, value) in items
-                ),
+                " tag, mode, filename, value"
+                ") VALUES (?, 1, ?, null, ?, null, 1, null, ?)",
+                ((key, now, now, value) for (key, value) in items),
             )
 
     def is_empty(self) -> bool:
         res = self._sql("SELECT EXISTS (SELECT 1 FROM Cache)", ())
         ((exists,),) = res
         return exists == 0
+
+    def set(self, key, value, expire=None, read=False, tag=None, retry=False) -> None:
+        return self.set_many([(key, value)], retry=retry)
+
+    def get(
+        self, key, default=None, read=False, expire_time=False, tag=False, retry=False
+    ):
+        cursor = self._sql("SELECT value FROM Cache WHERE key = ?", (key,))
+        if rows := cursor.fetchall():
+            return rows[0][0]
+        return default

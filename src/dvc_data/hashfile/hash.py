@@ -4,7 +4,7 @@ import logging
 from typing import TYPE_CHECKING, BinaryIO, Optional, cast
 
 from dvc_objects.fs import localfs
-from fsspec.callbacks import DEFAULT_CALLBACK, Callback
+from fsspec.callbacks import Callback
 from tqdm.utils import CallbackIOWrapper
 
 from dvc_data.callbacks import TqdmCallback
@@ -116,24 +116,25 @@ def fobj_md5(
 def file_md5(
     fname: "AnyFSPath",
     fs: "FileSystem" = localfs,
-    callback: "Callback" = DEFAULT_CALLBACK,
+    callback: Optional["Callback"] = None,
     name: str = DEFAULT_ALGORITHM,
     size: Optional[int] = None,
 ) -> str:
-    if size is None:
+    if size is None and callback is not None:
         size = fs.size(fname) or 0
+        callback.set_size(size)
 
-    callback.set_size(size)
     with fs.open(fname, "rb") as fobj:
-        wrapped = cast("BinaryIO", CallbackIOWrapper(callback.relative_update, fobj))
-        return fobj_md5(wrapped, name=name)
+        if callback is not None:
+            fobj = cast("BinaryIO", CallbackIOWrapper(callback.relative_update, fobj))
+        return fobj_md5(fobj, name=name)
 
 
 def _hash_file(
     path: "AnyFSPath",
     fs: "FileSystem",
     name: str,
-    callback: "Callback" = DEFAULT_CALLBACK,
+    callback: Optional["Callback"] = None,
     info: Optional[dict] = None,
 ) -> tuple["str", Meta]:
     info = info or fs.info(path)
@@ -191,7 +192,7 @@ def hash_file(
 ) -> tuple["Meta", "HashInfo"]:
     if state:
         meta, hash_info = state.get(path, fs, info=info)
-        if hash_info and hash_info.name == name:
+        if meta is not None and hash_info is not None and hash_info.name == name:
             return meta, hash_info
 
     cb = callback or LargeFileHashingCallback(desc=path)
@@ -199,7 +200,7 @@ def hash_file(
         hash_value, meta = _hash_file(path, fs, name, callback=cb, info=info)
     hash_info = HashInfo(name, hash_value)
     if state:
-        assert ".dir" not in hash_info.value
+        assert ".dir" not in hash_value
         state.save(path, fs, hash_info, info=info)
 
     return meta, hash_info
