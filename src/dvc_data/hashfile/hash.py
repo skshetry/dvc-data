@@ -48,6 +48,8 @@ def get_hasher(name: str) -> "hashlib._Hash":
 
 
 class HashStreamFile(io.IOBase):
+    __slots__ = ("fobj", "hasher", "total_read")
+
     def __init__(
         self,
         fobj: BinaryIO,
@@ -81,6 +83,8 @@ class HashStreamFile(io.IOBase):
 
 
 class Dos2UnixHashStreamFile(HashStreamFile):
+    __slots__ = ()
+
     def read(self, n=-1) -> bytes:
         # ideally, we want the heuristics to be applied in a similar way,
         # regardless of the size of the first chunk,
