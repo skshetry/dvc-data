@@ -4,6 +4,7 @@ import posixpath
 from collections.abc import Iterable
 from typing import TYPE_CHECKING, Any, Final, Optional
 
+import orjson
 from dvc_objects.errors import ObjectFormatError
 
 from dvc_data.compat import cached_property
@@ -188,10 +189,9 @@ class Tree(HashFile):
     @classmethod
     def load(cls, odb, hash_info, hash_name: Optional[str] = None) -> "Tree":
         obj = odb.get(hash_info.value)
-
         try:
             with obj.fs.open(obj.path, "r") as fobj:
-                raw = json.load(fobj)
+                raw = orjson.loads(fobj.read())
         except ValueError as exc:
             raise ObjectFormatError(f"{obj} is corrupted") from exc
 

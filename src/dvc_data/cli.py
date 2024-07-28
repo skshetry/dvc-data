@@ -1,6 +1,5 @@
 import enum
 import errno
-import json
 import math
 import os
 import posixpath
@@ -12,6 +11,7 @@ from pathlib import Path
 from posixpath import relpath
 
 import click
+import orjson
 import typer
 from attrs import asdict
 from dvc_objects.errors import ObjectFormatError
@@ -440,7 +440,7 @@ def process_patch(patch_file, **kwargs):
     if patch_file:
         with typer.open_file(patch_file) as f:
             text = f.read()
-            patch = json.loads(text)
+            patch = orjson.loads(text)
             for appl in patch:
                 op = appl.get("op")
                 path = appl.get("path")
