@@ -5,6 +5,7 @@ from typing import TYPE_CHECKING, BinaryIO, Optional, cast
 
 from dvc_objects.fs import localfs
 from fsspec.callbacks import Callback
+from fsspec.utils import nullcontext
 from tqdm.utils import CallbackIOWrapper
 
 from dvc_data.callbacks import TqdmCallback
@@ -199,12 +200,19 @@ def hash_file(
         if meta is not None and hash_info is not None and hash_info.name == name:
             return meta, hash_info
 
-    cb = callback or LargeFileHashingCallback(desc=path)
-    with cb:
-        hash_value, meta = _hash_file(path, fs, name, callback=cb, info=info)
-    hash_info = HashInfo(name, hash_value)
-    if state:
-        assert ".dir" not in hash_value
-        state.save(path, fs, hash_info, info=info)
+    size = info.get("size") if info else None
+    _callback = callback
+    # never initialize callback if it's never going to be used
+    if size and size < LargeFileHashingCallback.LARGE_FILE_SIZE:
+        _callback = nullcontext(None)
+    else:
+        _callback = LargeFileHashingCallback(desc=path)
 
+    with _callback as cb:
+        oid, meta = _hash_file(path, fs, name, callback=cb, info=info)
+
+    hash_info = HashInfo(name, oid)
+    if state:
+        assert ".dir" not in oid
+        state.save(path, fs, hash_info, info=info)
     return meta, hash_info

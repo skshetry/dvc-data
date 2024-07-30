@@ -10,6 +10,7 @@ from .diff import ROOT
 from .diff import diff as odiff
 
 if TYPE_CHECKING:
+    from dvc_objects.fs.base import FileSystem
     from fsspec import Callback
 
     from ._ignore import Ignore
@@ -36,15 +37,11 @@ class LinkError(Exception):
         super().__init__("No possible cache link types for '{path}'.")
 
 
-def _remove(path, fs, in_cache, force=False, prompt=None):
-    if not fs.exists(path):
-        return
+def _remove(path, fs: "FileSystem", in_cache, force=False, prompt=None):
+    if not force and not in_cache:
+        if not fs.exists(path):
+            return
 
-    if force:
-        fs.remove(path)
-        return
-
-    if not in_cache:
         msg = (
             f"file/directory '{path}' is going to be removed. "
             "Are you sure you want to proceed?"
@@ -53,7 +50,10 @@ def _remove(path, fs, in_cache, force=False, prompt=None):
         if prompt is None or not prompt(msg):
             raise PromptError(path)
 
-    fs.remove(path)
+    try:
+        fs.rm_file(path)
+    except FileNotFoundError:
+        pass
 
 
 def _relink(link, cache, cache_info, fs, path, in_cache, force, prompt=None):
@@ -155,11 +155,6 @@ class Link:
         self._callback = callback
 
     def __call__(self, cache, from_path, to_fs, to_path):
-        if to_fs.exists(to_path):
-            to_fs.remove(to_path)  # broken symlink
-
-        parent = to_fs.parent(to_path)
-        to_fs.makedirs(parent)
         try:
             transfer(
                 cache.fs,

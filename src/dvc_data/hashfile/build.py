@@ -1,21 +1,17 @@
 import hashlib
 import logging
 import os
-from functools import partial
-from multiprocessing import cpu_count
 from typing import TYPE_CHECKING, Optional, cast
 
-import funcy
 from dvc_objects.executors import ThreadPoolExecutor
 from fsspec.callbacks import DEFAULT_CALLBACK, Callback
-from fsspec.utils import nullcontext
 
 from dvc_data.callbacks import TqdmCallback
 from dvc_data.hashfile.hash_info import HashInfo
 from dvc_data.hashfile.state import StateBase
 
 from .db.reference import ReferenceHashFileDB
-from .hash import LargeFileHashingCallback, _hash_file, hash_file
+from .hash import hash_file
 from .meta import Meta
 from .obj import HashFile
 
@@ -95,7 +91,104 @@ def _build_file(path, fs, name, odb=None, upload_odb=None, dry_run=False):
     return meta, obj
 
 
-@funcy.print_durations
+def _hash_files(
+    fs: "FileSystem",
+    name: str,
+    small_files_to_hash: list[tuple[str, dict]],
+    large_files_to_hash: list[tuple[str, dict]],
+    callback: "Callback" = DEFAULT_CALLBACK,
+    jobs: Optional[int] = None,
+) -> dict[str, tuple[Meta, HashInfo, dict]]:
+    def _hash(arg: tuple[str, dict]) -> tuple[str, tuple[Meta, HashInfo, dict]]:
+        p, info = arg
+        # `hash_file` only hashes files that are not in `state`, so we need to pass
+        # `state=None` here. We'll save the hashes outside this function.
+        meta, hi = hash_file(p, fs, name, state=None, info=info)
+        return p, (meta, hi, info)
+
+    hashes: dict[str, tuple[Meta, HashInfo, dict]]
+
+    small_files = map(_hash, small_files_to_hash)
+    hashes = dict(callback.wrap(small_files))
+    if large_files_to_hash:
+        jobs = 4 if jobs is None else jobs
+        with ThreadPoolExecutor(max_workers=jobs) as executor:
+            large_files = executor.imap_unordered(_hash, large_files_to_hash)
+            hashes.update(callback.wrap(large_files))
+    return hashes
+
+
+def _build_files(  # noqa: PLR0913
+    path: str,
+    root: str,
+    fnames: list[str],
+    fs: "FileSystem",
+    name: str,
+    odb: Optional["HashFileDB"] = None,
+    callback: "Callback" = DEFAULT_CALLBACK,
+    upload_odb: Optional["HashFileDB"] = None,
+    dry_run: bool = False,
+    jobs: Optional[int] = None,
+    large_file_threshold: int = 2**20,
+) -> dict[str, tuple[Meta, HashInfo]]:
+    paths: list[str] = [f"{root}{fs.sep}{fname}" for fname in fnames]
+    state: Optional[StateBase] = odb.state if odb else None
+
+    state_data: dict[str, tuple[Meta, HashInfo, dict]] = {}
+    large_files_to_hash: list[tuple[str, dict]] = []
+    small_files_to_hash: list[tuple[str, dict]] = []
+
+    infos: dict[str, dict] = {path: fs.info(path) for path in paths}
+    if state and paths:
+        for p, meta, hi in state.get_many(paths, fs, infos):
+            if meta is not None and hi is not None and hi.name == name:
+                state_data[p] = (meta, hi, infos[p])
+            else:
+                info = infos[p]
+                size = info.get("size")
+                if size and size > large_file_threshold:
+                    large_files_to_hash.append((p, info))
+                else:
+                    small_files_to_hash.append((p, info))
+
+    callback.set_size((callback.size or 0) + len(paths))
+    callback.relative_update(len(state_data))
+    hashes_to_update = _hash_files(
+        fs,
+        name,
+        small_files_to_hash,
+        large_files_to_hash,
+        callback=callback,
+        jobs=jobs,
+    )
+
+    if state and hashes_to_update:
+        items = ((path, hi, info) for path, (_, hi, info) in hashes_to_update.items())
+        state.save_many(items, fs)
+        state_data.update(hashes_to_update)
+
+    objects: dict[str, tuple[Meta, HashInfo]] = {}
+    if upload_odb is not None and not dry_run:
+        assert odb is not None
+        assert name == "md5"
+        for fname, p in zip(fnames, paths):
+            meta, obj = _upload_file(p, fs, odb, upload_odb)
+            objects[fname] = (meta, obj.hash_info)
+        return objects
+
+    if not dry_run:
+        assert odb is not None
+        to_add = {p: oid for p in paths if (oid := state_data[p][1].value) is not None}
+        oids = list(to_add.values())
+        paths = list(to_add)
+        odb.add(paths, fs, oids, hardlink=False)
+
+    for fname, p in zip(fnames, paths):
+        meta, hi, _ = state_data[p]
+        objects[fname] = meta, hi
+    return objects
+
+
 def _build_tree(
     path,
     fs,
@@ -299,117 +392,3 @@ def build(
         )
 
     return staging, meta, obj
-
-
-def _build_files(  # noqa: PLR0913
-    path: str,
-    root: str,
-    fnames: list[str],
-    fs: "FileSystem",
-    name: str,
-    odb: Optional["HashFileDB"] = None,
-    callback: "Callback" = DEFAULT_CALLBACK,
-    upload_odb: Optional["HashFileDB"] = None,
-    dry_run: bool = False,
-    jobs: Optional[int] = None,
-    large_file_threshold: int = 2**20,
-) -> dict[str, tuple[Meta, HashInfo]]:
-    paths: list[str] = [f"{root}{fs.sep}{fname}" for fname in fnames]
-    state: Optional[StateBase] = odb.state if odb else None
-
-    state_data: dict[str, tuple[Meta, HashInfo, dict]] = {}
-    large_files_to_hash: list[tuple[str, dict]] = []
-    small_files_to_hash: list[tuple[str, dict]] = []
-
-    infos: dict[str, dict] = {path: fs.info(path) for path in paths}
-    if state and paths:
-        for p, meta, hi in state.get_many(paths, fs, infos):
-            if meta is not None and hi is not None and hi.name == name:
-                state_data[p] = (meta, hi, infos[p])
-            else:
-                info = infos[p]
-                size = info.get("size")
-                if size and size > large_file_threshold:
-                    large_files_to_hash.append((p, info))
-                else:
-                    small_files_to_hash.append((p, info))
-
-    callback.set_size((callback.size or 0) + len(paths))
-    callback.relative_update(len(state_data))
-    hashes_to_update = _hash_files(
-        fs,
-        name,
-        small_files_to_hash,
-        large_files_to_hash,
-        callback=callback,
-        jobs=jobs,
-    )
-
-    if state and hashes_to_update:
-        items = ((path, hi, info) for path, (_, hi, info) in hashes_to_update.items())
-        state.save_many(items, fs)
-        state_data.update(hashes_to_update)
-
-    objects: dict[str, tuple[Meta, HashInfo]] = {}
-    if upload_odb is not None and not dry_run:
-        assert odb is not None
-        assert name == "md5"
-        for fname, p in zip(fnames, paths):
-            meta, obj = _upload_file(p, fs, odb, upload_odb)
-            objects[fname] = (meta, obj.hash_info)
-        return objects
-
-    if not dry_run:
-        assert odb is not None
-        to_add = {p: oid for p in paths if (oid := state_data[p][1].value) is not None}
-        oids = list(to_add.values())
-        paths = list(to_add)
-        odb.add(paths, fs, oids, hardlink=False)
-
-    for fname, p in zip(fnames, paths):
-        meta, hi, _ = state_data[p]
-        objects[fname] = meta, hi
-    return objects
-
-
-def _hash_single_file(
-    fs: "FileSystem",
-    name: str,
-    arg: tuple[str, dict],
-) -> tuple[str, tuple[Meta, HashInfo, dict]]:
-    p, info = arg
-    size = info.get("size")
-    context = nullcontext(None)
-    if size and size > LargeFileHashingCallback.LARGE_FILE_SIZE:
-        context = LargeFileHashingCallback(desc=p)
-
-    with context as cb:
-        oid, meta = _hash_file(p, fs, name, info=info, callback=cb)
-    return p, (meta, HashInfo(name, oid), info)
-
-
-def _hash_files(
-    fs: "FileSystem",
-    name: str,
-    small_files_to_hash: list[tuple[str, dict]],
-    large_files_to_hash: list[tuple[str, dict]],
-    callback: "Callback" = DEFAULT_CALLBACK,
-    jobs: Optional[int] = None,
-) -> dict[str, tuple[Meta, HashInfo, dict]]:
-    if jobs is None:
-        jobs = max(cpu_count(), 6)
-    assert jobs is not None
-
-    hashes: dict[str, tuple[Meta, HashInfo, dict]] = {}
-
-    for p, info in small_files_to_hash:
-        oid, meta = _hash_file(p, fs, name, info=info)
-        hashes[p] = meta, HashInfo(name, oid), info
-        callback.relative_update()
-
-    if large_files_to_hash:
-        func = partial(_hash_single_file, fs, name)
-        with ThreadPoolExecutor(max_workers=jobs) as executor:
-            large_files = executor.imap_unordered(func, large_files_to_hash)
-            hashes.update(callback.wrap(large_files))
-    return hashes
